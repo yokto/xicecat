@@ -7,6 +7,7 @@
 #include <nice/agent.h>
 #include <nice/pseudotcp.h>
 /* END: libnice imports */
+#include <glib-unix.h>
 
 #include <gloox/client.h>
 #include <gloox/connectionlistener.h>
@@ -16,11 +17,12 @@
 #include <gloox/messagehandler.h>
 #include <gloox/message.h>
 
+#include <gio/gunixinputstream.h>
+#include <gio/gunixoutputstream.h>
+
 #include <sstream>
 #include <iostream>
 #include <string>
-
-#include <pthread.h>
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -38,23 +40,36 @@ using namespace gloox;
 enum Mode { SERVER, CLIENT };
 
 timeval t; // just for some debugging
+GError * error = NULL;
 
 class Icer;
 
+const static int buffer_size = 65536;
+
+struct StreamState {
+	GInputStream * in;
+	GOutputStream * out;
+	gssize read_bytes;
+	gssize written_bytes;
+	unsigned char buffer[buffer_size];
+	char* inname;
+	char* outname;
+};
+
 class Agent {
 public:
-	unsigned char* in_buffer =NULL;
-	unsigned char* out_buffer = NULL;
-	const static int buffer_size = 65536;
-	pthread_t in_thread;
-	pthread_t out_thread;
 	string remote_candidates;
+	bool negotiationComplete = false;
+
+	StreamState remoteToLocal;
+	StreamState localToRemote;
 
 	GIOStream * gstream;
 	
 	GMainLoop *gloop = NULL;
 
 	int sock;
+
 	const static int component = 1;	
 	NiceAgent * agent;
 	guint stream_id;
@@ -78,19 +93,20 @@ public:
 	int print_local_data(guint stream_id, guint component_id, string & candidates);
 
 	static void gathering_done(NiceAgent *agent1, guint stream_id, gpointer data);
-	
-	void* runIn();
-	void* runOut();
-	static void* runInWrap(void* agent) { return ((Agent*)agent)->runIn(); }
-	static void* runOutWrap(void* agent) { return ((Agent*)agent)->runOut(); }
 };
 
 /* START: LIBNICE DECLS */
 static const gchar *candidate_type_name[] = {"host", "srflx", "prflx", "relay"};
-
-static const gchar *state_name[] = {"disconnected", "gathering", "connecting",
-                                    "connected", "ready", "failed"};
+static const gchar *candidate_transport_name[] = {"udp", "tcp_active", "tcp_passive", "tcp_so"};
 /* END: LIBNICE DECLS */
+
+// dirty hack
+int slp(void*) {
+	cerr << "kill";
+	usleep(1000 * 1000);
+	exit(0);
+	return true;
+}
 
 class Icer : public MessageHandler, public ConnectionListener
 {
@@ -129,7 +145,7 @@ public:
 // 		}
 	}
 	void onConnect() {
-		g_debug("connected yes with jid: %s", c->jid().full().c_str());
+		g_message("connected yes with jid: %s", c->jid().full().c_str());
 		if (mode == CLIENT) {
 			c->send(Message(Message::Normal, *otherJid, "hi"));
 			agent = new Agent(this, *otherJid);
@@ -140,7 +156,7 @@ public:
 		}
 	}
 	bool onTLSConnect(const CertInfo& cert) {
-		g_debug("ignoring tls certificate (we don't care)");
+		g_message("ignoring tls certificate (we don't care)");
 		return true;
 	}
 	void onDisconnect(ConnectionError e) {
@@ -149,7 +165,7 @@ public:
 		cerr << "error: " << e << "\n";
 	}
 	void handleMessage (const Message &msg, MessageSession *session=0) {
-		g_debug("XMPP Message: %s\n\t%s", msg.subject().c_str(), msg.body().c_str());
+		g_message("XMPP Message: %s\n\t%s", msg.subject().c_str(), msg.body().c_str());
 
 		if (msg.subject()==request) {
 			if (mode==SERVER) {
@@ -159,12 +175,12 @@ public:
 				if (pid < 0) { g_error("Failed to fork."); }
 				if (pid > 0) { 
 					/* parent */
-					g_debug("waiting for first fork");
+					g_message("waiting for first fork");
 					waitpid(pid, NULL, 0);
 					
 					int readed = read(pipefd[0], pipe_buffer, pipe_buffer_size);
 					if (readed < 1 || pipe_buffer[readed] != 0) { g_error("something is wrong with candidates"); }
-					g_debug("going to send candidates");
+					g_message("going to send candidates");
 					otherJid = new JID(msg.from().full());
 					pendingAnswer = true;
 				}
@@ -176,7 +192,8 @@ public:
 					if (pid == 0) {
 						agent = new Agent(this, msg.from());
 						agent->parse_remote_data(1, msg.body());
-						g_debug("starting gloop server");
+						g_message("starting gloop server");
+						g_unix_signal_add (15, &slp, NULL);
 						//g_timeout_add(5000, &Agent::closeTimeout, (void*) agent->gstream);
 						g_main_loop_run(agent->gloop);
 						g_error("how can this end");
@@ -184,7 +201,7 @@ public:
 				}
 			} else {
 				agent->parse_remote_data(1, msg.body());
-				g_debug("starting gloop client");
+				g_message("starting gloop client");
 				g_main_loop_run(agent->gloop);
 			}
 		}
@@ -196,15 +213,15 @@ public:
 };
 const string Icer::request = "REQUEST ICE";
 
-
 void argFail(char * prog) {
 	g_error("\nUsage: %s server <jid@example.com/resource> <password> <stun.example.com> <stun_port> <localport>\n"
-				"       %s client <jid@example.com> <password> <stun.example.com> <stun_port> <server_jid@example.com/resource\n", prog, prog);
+				"       %s client <jid@example.com> <password> <stun.example.com> <stun_port> <server_jid@example.com/resource\n",
+				prog, prog);
 	exit(EXIT_FAILURE);
 }
 
 int main(int argc, char* argv[]) {
-	g_debug("debuging");
+	g_message("debuging");
 	//nice_debug_enable (true);
 	Mode mode;
 	string password;
@@ -259,27 +276,53 @@ void Icer::requestICE(const JID & jid, const string & cands) {
 	c->send(m);
 }
 
-Agent::~Agent() {
-	pthread_t self = pthread_self();
-	if (! pthread_equal(self, in_thread)) { pthread_cancel(in_thread); }
-	if (! pthread_equal(self, out_thread)) { pthread_cancel(out_thread); }
-	
+static void read_func(GObject *obj, GAsyncResult *res, gpointer sstate_);
+static void written_func(GObject *obj, GAsyncResult *res, gpointer sstate_);
+
+static void read_func(GObject *obj, GAsyncResult *res, gpointer sstate_) {
+	StreamState * sstate = (StreamState*) sstate_;
+	sstate->read_bytes = g_input_stream_read_finish(sstate->in, res, &error);
+	if (sstate->read_bytes < 0) { g_error("reading error: %s", error->message); }
+	if (sstate->read_bytes == 0) { exit(0); }
+	g_message("received from %s: %d", sstate->inname, sstate->read_bytes);
+	g_output_stream_write_async(sstate->out, sstate->buffer, sstate->read_bytes,
+				G_PRIORITY_DEFAULT, NULL, &written_func, sstate_);
+}
+
+static void written_func(GObject *obj, GAsyncResult *res, gpointer sstate_) {
+	StreamState * sstate = (StreamState *) sstate_;
+	gssize wrtn = g_output_stream_write_finish(sstate->out, res, NULL);
+	sstate->written_bytes += wrtn;
+	g_message("sent to %s: %d", sstate->outname, wrtn);
+	if (wrtn < 0) { g_error("can't write to %sanymore", sstate->outname); }
+	if (sstate->written_bytes < sstate->read_bytes) {
+		g_output_stream_write_async(
+				sstate->out,
+				sstate->buffer + sstate->written_bytes,
+				sstate->read_bytes - sstate->written_bytes,
+				G_PRIORITY_DEFAULT, NULL, &written_func, sstate_);
+	} else {
+		sstate->written_bytes = 0;
+		g_input_stream_read_async(sstate->in, sstate->buffer, buffer_size,
+				G_PRIORITY_DEFAULT, NULL, &read_func, sstate_);
+	}
+}
+
+
+Agent::~Agent() {	
 	delete otherJid;
 
-	
 	if (parent->mode=SERVER) { close(sock); }
 	
 	g_object_unref(agent);
-	free(in_buffer);
-	free(out_buffer);
 	g_main_loop_unref(gloop);
 }
 
 Agent::Agent(Icer * icer, const JID & otherJid) : parent(icer) {
-	gloop = g_main_loop_new(NULL, FALSE);	
+	gloop = g_main_loop_new(NULL, false);	
 	this->otherJid = new JID(otherJid.full());
 	gboolean controlling = icer->mode == CLIENT ? true : false;
-	g_debug("creating nice agent");
+	g_message("creating nice agent");
 	agent = nice_agent_new_reliable(g_main_loop_get_context (gloop),
 		NICE_COMPATIBILITY_RFC5245);
 	if (agent == NULL)
@@ -308,124 +351,78 @@ Agent::Agent(Icer * icer, const JID & otherJid) : parent(icer) {
 	if (!nice_agent_gather_candidates(agent, stream_id))
 		g_error("Failed to start candidate gathering");
 
-	g_debug("waiting for candidate-gathering-done signal...");
+	g_message("waiting for candidate-gathering-done signal...");
 
 	initTCP();
-	//pthread_create(&stupid_thread, NULL, &stupid_read, (void*) this );
-
-	in_buffer = (unsigned char*) malloc(buffer_size);
-	out_buffer = (unsigned char*) malloc(buffer_size);
-	if (in_buffer == NULL | out_buffer == NULL) { g_error("no buffer"); }
 
 	gstream = nice_agent_get_io_stream(agent, stream_id, component);
-	pthread_create(&in_thread, NULL, &Agent::runInWrap, (void*) this);
+
+	remoteToLocal.in = g_io_stream_get_input_stream(gstream);
+	remoteToLocal.read_bytes = 0;
+	remoteToLocal.written_bytes = 0;
+	remoteToLocal.inname = "remote";
+	remoteToLocal.outname = "local";
+
+	localToRemote.out = g_io_stream_get_output_stream(gstream);
+	localToRemote.read_bytes = 0;
+	localToRemote.written_bytes = 0;
+	localToRemote.inname = "local";
+	localToRemote.outname = "remote";
+	if (icer->mode == CLIENT) {
+		remoteToLocal.out = g_unix_output_stream_new(fileno(stdout), true);
+		localToRemote.in = g_unix_input_stream_new(fileno(stdin), TRUE);
+	}
+	
+	g_input_stream_read_async(remoteToLocal.in, remoteToLocal.buffer, buffer_size,
+			G_PRIORITY_DEFAULT, NULL, &read_func, (gpointer)&remoteToLocal);
 }
 
 gboolean Agent::closeTimeout(void* stream) {
 	if (g_io_stream_is_closed((GIOStream *) stream))
 		{ g_error("stream is closed exiting"); }
 	else
-		{ g_debug("stream is still open"); }
+		{ g_message("stream is still open"); }
 	return G_SOURCE_CONTINUE;
 }
 
 void Agent::initTCP() {
-	if (parent->mode == SERVER) {
-		g_debug("creating local TCP connection to localhost:%d",parent->localport);
+	if (parent->mode == CLIENT ) { return; }
+	g_message("creating local TCP connection to localhost:%s",parent->localport);
 
-		addrinfo * info = NULL;
-		if (getaddrinfo("localhost", parent->localport, NULL, &info) != 0 || info == NULL)
-			g_error("can't get address of localhost");
-		sock = socket(info->ai_family, SOCK_STREAM, 0);
-		if (sock == -1)
-			g_error("can't get socket");
-		if (connect(sock, info->ai_addr, info->ai_addrlen) == -1)
-			g_error("can't connect to localhost");
-		freeaddrinfo(info); // need this because it's a linked list
+	/* create a new connection */
+	GSocketConnection * connection = NULL;
+	GSocketClient * client = g_socket_client_new();
+
+	/* connect to the host */
+	connection = g_socket_client_connect_to_host (
+		client,
+		(gchar*)"localhost",
+		atoi(parent->localport), /* your port goes here */
+		NULL,
+		&error);
+
+	/* don't forget to check for errors */
+	if (error != NULL)
+	{
+		g_error (error->message);
 	}
-}
-
-void* Agent::runIn() {
-	g_debug("start receiving from remote");
-	while (true) {
-
-		GError * e=NULL;
-		if(g_io_stream_get_input_stream(gstream)==NULL) { g_error("no in stream\n\n\n\n\n"); }
-// 		int recved = g_input_stream_read(g_io_stream_get_input_stream(gstream), (char*) in_buffer, 7, NULL, &e);
-// 
-// 		if (recved < 0) { g_error("reading error: %s", e->message); }
-// 		if (recved == 0) { g_error("eof handle"); }
-
-		int recved = nice_agent_recv(agent, stream_id, component, in_buffer, 1, NULL, NULL);
-		if (recved != 1) { g_error("did not receive 1, ret=%d",recved); }
-		int recved2 = nice_agent_recv_nonblocking(agent, stream_id, component, in_buffer+1, buffer_size-1, NULL, NULL);
-		if (recved2 < 0) { g_error("did not receive2"); }
-		recved += recved2;
-
-		//gettimeofday(&t, NULL); cerr << t.tv_sec << " " << t.tv_usec << "\n";
-		g_debug("received from remote: %d", recved);
-		int sent=0;
-		while (sent!=recved) {
-			if (parent->mode == SERVER) {
-				sent = send(sock, in_buffer, recved, 0);
-				if (sent != recved) g_error("could not tcp send");
-			} else {
-				int res = write(fileno(stdout), in_buffer + sent, recved-sent);
-				if (res<0) { g_error("die die"); }
-				sent += res;
-				g_debug("sent to local %d", sent);
-			}
-		}
+	else
+	{
+		g_print ("Connection successful!\n");
 	}
+	localToRemote.in = g_io_stream_get_input_stream (G_IO_STREAM (connection));
+	remoteToLocal.out = g_io_stream_get_output_stream (G_IO_STREAM (connection));
 }
-
-void* Agent::runOut() {
-	g_debug("start sending to remote");
-	while (true) {
-		int recved;
-		if (parent->mode == SERVER) {
-			recved = recv(sock, out_buffer, buffer_size, 0);
-		} else {
-			recved = read(fileno(stdin), out_buffer, buffer_size);
-		}
-		if (recved < 0) {
-			g_error("failed to read data %d", strerror(errno));
-		}
-
-		if (recved == 0) {
-			// TODO: onesided shutdown
-			g_debug("end of stdin/socket; shuting down outstream");
-			if(g_output_stream_close(g_io_stream_get_output_stream(gstream), NULL, NULL) == false)
-				{ g_error("could not close"); }
-			pthread_exit(0);			
-		}
-
-		//gettimeofday(&t, NULL); cerr << t.tv_sec << " " << t.tv_usec << "\n";
-		g_debug("received from local: %d", recved);
-
-		int sent=0;
-		while (sent != recved) {
-			int res = g_output_stream_write(g_io_stream_get_output_stream(gstream), (char*) out_buffer + sent, recved-sent, NULL, NULL);
-			if (res <= 0) { g_error("can't send");
-			} else {
-				//gettimeofday(&t, NULL); cerr << t.tv_sec << " " << t.tv_usec << "\n";
-				g_debug("sent to remote: %d", res);
-				sent += res;
-			}
-		}
-	}
-}
-			
 
 void Agent::gathering_done(NiceAgent *agent1, guint stream_id, gpointer data)
 {
 	Agent * agent = (Agent*) data;
 	string candidates = string();
-	g_debug("SIGNAL candidate gathering done");
+	g_message("SIGNAL candidate gathering done");
 
 	// Candidate gathering is done. Send our local candidates on stdout
 	agent->print_local_data(stream_id, 1, candidates);
-	g_debug("Candidates are:\n\t%s", candidates.c_str());
+	g_message("Candidates are:\n\t%s", candidates.c_str());
 
 	if(strlen(candidates.c_str())+1 > Icer::pipe_buffer_size) { g_error("too many candidates"); }
 	write(agent->parent->pipefd[1], candidates.c_str(), strlen(candidates.c_str())+1);
@@ -438,11 +435,18 @@ void Agent::component_state_changed(NiceAgent *agent, guint stream_id,
     gpointer data)
 {
 	Agent* a = (Agent*) data;
-	g_debug("SIGNAL: state changed stream=%d component=%d %s[%d]",
-		stream_id, component_id, state_name[state], state);
+	g_message("SIGNAL: state changed stream=%d component=%d %s[%d]",
+		stream_id, component_id, nice_component_state_to_string((NiceComponentState)state), state);
 
 	if (state == NICE_COMPONENT_STATE_READY) {
-		pthread_create(&a->out_thread, NULL, &Agent::runOutWrap, (void*) a );
+		if(a->negotiationComplete) {
+			g_warning("two times complete");
+			return;
+		} else {
+			a->negotiationComplete = TRUE;
+		}
+		g_input_stream_read_async(a->localToRemote.in, a->localToRemote.buffer, buffer_size, 
+				G_PRIORITY_DEFAULT, NULL, &read_func, (gpointer)&(a->localToRemote));
 
 		NiceCandidate *local, *remote;
 		// Get current selected candidate pair and print IP address used
@@ -453,13 +457,15 @@ void Agent::component_state_changed(NiceAgent *agent, guint stream_id,
 
 			nice_address_to_string(&local->addr, ipaddr_local);
 			nice_address_to_string(&remote->addr, ipaddr_remote);
-			g_debug("Negotiation complete: ([%s]:%d, [%s]:%d)",
-				ipaddr_local, nice_address_get_port(&local->addr),
-				ipaddr_remote, nice_address_get_port(&remote->addr));
+			g_message("Negotiation complete: (%s://s[%s]:%d, %s://[%s]:%d)",
+				candidate_transport_name[local->transport],
+					ipaddr_local, nice_address_get_port(&local->addr),
+				candidate_transport_name[remote->transport],
+					ipaddr_remote, nice_address_get_port(&remote->addr));
 		}
 
 	} else if (state == NICE_COMPONENT_STATE_FAILED || state == NICE_COMPONENT_STATE_DISCONNECTED) {
-		g_debug("component failed. This could be a normal eof.");
+		g_error("component failed. This could be a normal eof.");
 		exit(0);
 	}
 }
@@ -469,51 +475,61 @@ void Agent::new_selected_pair(NiceAgent *agent, guint stream_id,
     gchar *rfoundation, gpointer data)
 {
 	//Agent * a = (Agent *) data;
-	g_debug("SIGNAL: selected pair %s %s", lfoundation, rfoundation);
+	g_message("SIGNAL: selected pair %s %s", lfoundation, rfoundation);
 }
 
 static NiceCandidate *
 parse_candidate(char *scand, guint stream_id)
 {
-  NiceCandidate *cand = NULL;
-  NiceCandidateType ntype;
-  gchar **tokens = NULL;
-  guint i;
+	NiceCandidate *cand = NULL;
+	NiceCandidateType ntype;
+	NiceCandidateTransport ntransport;
+	gchar **tokens = NULL;
+	guint i;
 
-  tokens = g_strsplit (scand, ",", 5);
-  for (i = 0; tokens && tokens[i]; i++);
-  if (i != 5)
-    goto end;
+	tokens = g_strsplit (scand, ",", 7);
+	for (i = 0; tokens && tokens[i]; i++);
+	if (i != 7)
+		{ goto end; }
+		
+	for (i = 0; i < G_N_ELEMENTS (candidate_type_name); i++) {
+		if (strcmp(tokens[5], candidate_type_name[i]) == 0) {
+			ntype = (NiceCandidateType) i;
+			break;
+		}
+	}
+	if (i == G_N_ELEMENTS (candidate_type_name))
+		{ goto end; }
+	for (i = 0; i < G_N_ELEMENTS(candidate_transport_name); i++){
+		if (strcmp(tokens[6], candidate_transport_name[i]) == 0) {
+			ntransport = (NiceCandidateTransport) i;
+			break;
+		}
+	}
+	if (i == G_N_ELEMENTS (candidate_transport_name))
+		{ goto end; }
 
-  for (i = 0; i < G_N_ELEMENTS (candidate_type_name); i++) {
-    if (strcmp(tokens[4], candidate_type_name[i]) == 0) {
-      ntype = (NiceCandidateType) i;
-      break;
-    }
-  }
-  if (i == G_N_ELEMENTS (candidate_type_name))
-    goto end;
+	cand = nice_candidate_new(ntype);
+	cand->component_id = 1;
+	cand->stream_id = stream_id;
+	cand->transport = ntransport;
+	strncpy(cand->foundation, tokens[0], NICE_CANDIDATE_MAX_FOUNDATION);
+	cand->priority = atoi (tokens[1]);
 
-  cand = nice_candidate_new(ntype);
-  cand->component_id = 1;
-  cand->stream_id = stream_id;
-  cand->transport = NICE_CANDIDATE_TRANSPORT_UDP;
-  strncpy(cand->foundation, tokens[0], NICE_CANDIDATE_MAX_FOUNDATION);
-  cand->priority = atoi (tokens[1]);
+	if (!nice_address_set_from_string(&cand->addr, tokens[2])
+			|| !nice_address_set_from_string(&cand->base_addr, tokens[3])) {
+		g_message("failed to parse addr: %s", tokens[2]);
+		nice_candidate_free(cand);
+		cand = NULL;
+		goto end;
+	}
 
-  if (!nice_address_set_from_string(&cand->addr, tokens[2])) {
-    g_debug("failed to parse addr: %s", tokens[2]);
-    nice_candidate_free(cand);
-    cand = NULL;
-    goto end;
-  }
+	nice_address_set_port(&cand->addr, atoi (tokens[4]));
 
-  nice_address_set_port(&cand->addr, atoi (tokens[3]));
+end:
+	g_strfreev(tokens);
 
- end:
-  g_strfreev(tokens);
-
-  return cand;
+	return cand;
 }
 
 int Agent::print_local_data (guint stream_id, guint component_id, string & candidates)
@@ -522,6 +538,7 @@ int Agent::print_local_data (guint stream_id, guint component_id, string & candi
 	gchar *local_ufrag = NULL;
 	gchar *local_password = NULL;
 	gchar ipaddr[INET6_ADDRSTRLEN];
+	gchar ipaddr_base[INET6_ADDRSTRLEN];
 	GSList *cands = NULL, *item;
 	
 	stringstream stream;
@@ -540,14 +557,24 @@ int Agent::print_local_data (guint stream_id, guint component_id, string & candi
 		NiceCandidate *c = (NiceCandidate *)item->data;
 
 		nice_address_to_string(&c->addr, ipaddr);
+		nice_address_to_string(&c->base_addr, ipaddr_base);
 
-		stream
-			<< " "
-			<< c->foundation << ","
-			<< c->priority << ","
-			<< ipaddr << ","
-			<< nice_address_get_port(&c->addr) << ","
-			<< candidate_type_name[c->type];
+		
+		//if (c->transport != NICE_CANDIDATE_TRANSPORT_UDP) {
+		//if(c->transport == NICE_CANDIDATE_TRANSPORT_UDP) {
+		if(ipaddr[4]!=':' && c->transport == NICE_CANDIDATE_TRANSPORT_UDP) {
+			stream
+				<< " "
+				<< c->foundation << ","
+				<< c->priority << ","
+				<< ipaddr << ","
+				<< ipaddr_base << ","
+				<< nice_address_get_port(&c->addr) << ","
+				<< candidate_type_name[c->type] << ","
+				<< candidate_transport_name[c->transport];
+		} else {
+			//printf("not candidate: %s,%d,%d \n\n\n\n\n:", candidate_transport_name[c->transport], c->transport,NICE_CANDIDATE_TRANSPORT_UDP);
+		}
 	}
 	result = EXIT_SUCCESS;
 
@@ -591,26 +618,26 @@ int Agent::parse_remote_data(guint component_id, string line_str)
       NiceCandidate *c = parse_candidate(line_argv[i], stream_id);
 
       if (c == NULL) {
-        g_debug("failed to parse candidate: %s", line_argv[i]);
+        g_message("failed to parse candidate: %s", line_argv[i]);
         goto end;
       }
       remote_candidates = g_slist_prepend(remote_candidates, c);
     }
   }
   if (ufrag == NULL || passwd == NULL || remote_candidates == NULL) {
-    g_debug("line must have at least ufrag, password, and one candidate");
+    g_message("line must have at least ufrag, password, and one candidate");
     goto end;
   }
 
   if (!nice_agent_set_remote_credentials(agent, stream_id, ufrag, passwd)) {
-    g_debug("failed to set remote credentials");
+    g_message("failed to set remote credentials");
     goto end;
   }
 
   // Note: this will trigger the start of negotiation.
   if (nice_agent_set_remote_candidates(agent, stream_id, component_id,
       remote_candidates) < 1) {
-    g_debug("failed to set remote candidates");
+    g_message("failed to set remote candidates");
     goto end;
   }
 
