@@ -16,9 +16,11 @@ alternatively if you have a redo program
 
 	redo xicecat
 
-If libnice is installed in your home. Use "PKG_CONFIG_PATH=/path/lib/pkgconfig" and "-Wl,-rpath /home/silvio/stuff/libnice-install/lib/".
+If libnice is installed in your home. Use "PKG_CONFIG_PATH=/path/lib/pkgconfig" and "-Wl,-rpath /path/to/lib/folder/".
 
 ## Use
+
+Make a new xmpp account. Your xmpp password will be on ps and in future versions you might even get messages.
 
 xicecat currently does *not work with google a google account* because google changes the resource name.
 
@@ -37,8 +39,6 @@ To use it with ssh run the command on the server and put the following in your s
 ### Big Problems
 
 * Your xmpp password will be on ps so it is adviced that you create a seperate account for this.
-
-* biggest problem: libnice can't figure out when a connection closes so all connections on the server stay open
 
 ### Minor Problems
 
