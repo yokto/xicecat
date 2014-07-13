@@ -21,15 +21,9 @@
 #include <gio/gunixoutputstream.h>
 
 #include <sstream>
-#include <iostream>
 #include <string>
 
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <netdb.h>
-
 #include <unistd.h>
-#include <errno.h>
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <sys/types.h>
@@ -59,7 +53,7 @@ struct StreamState {
 class Agent {
 public:
 	string remote_candidates;
-	bool negotiationComplete = false;
+	bool negotiationComplete;
 
 	StreamState remoteToLocal;
 	StreamState localToRemote;
@@ -102,7 +96,7 @@ static const gchar *candidate_transport_name[] = {"udp", "tcp_active", "tcp_pass
 
 // dirty hack
 int slp(void*) {
-	cerr << "kill";
+	g_error("kill");
 	usleep(1000 * 1000);
 	exit(0);
 	return true;
@@ -160,9 +154,8 @@ public:
 		return true;
 	}
 	void onDisconnect(ConnectionError e) {
-		cerr << "stream error: " << c->streamError() << "\n";
-		cerr << "stream error text: " << c->streamErrorText() << "\n";
-		cerr << "error: " << e << "\n";
+		g_warning("stream error: %d", c->streamError());
+		g_warning("stream error text: %s", c->streamErrorText().c_str());
 	}
 	void handleMessage (const Message &msg, MessageSession *session=0) {
 		g_message("XMPP Message: %s\n\t%s", msg.subject().c_str(), msg.body().c_str());
@@ -308,6 +301,12 @@ static void written_func(GObject *obj, GAsyncResult *res, gpointer sstate_) {
 	}
 }
 
+bool timeoutCheck(Agent* out) {
+	g_message("restart");
+	nice_agent_restart_stream(out->agent, out->stream_id);
+	return true;
+}
+
 
 Agent::~Agent() {	
 	delete otherJid;
@@ -319,6 +318,7 @@ Agent::~Agent() {
 }
 
 Agent::Agent(Icer * icer, const JID & otherJid) : parent(icer) {
+	negotiationComplete=false;
 	gloop = g_main_loop_new(NULL, false);	
 	this->otherJid = new JID(otherJid.full());
 	gboolean controlling = icer->mode == CLIENT ? true : false;
@@ -360,14 +360,14 @@ Agent::Agent(Icer * icer, const JID & otherJid) : parent(icer) {
 	remoteToLocal.in = g_io_stream_get_input_stream(gstream);
 	remoteToLocal.read_bytes = 0;
 	remoteToLocal.written_bytes = 0;
-	remoteToLocal.inname = "remote";
-	remoteToLocal.outname = "local";
+	remoteToLocal.inname = (char*)"remote";
+	remoteToLocal.outname = (char*)"local";
 
 	localToRemote.out = g_io_stream_get_output_stream(gstream);
 	localToRemote.read_bytes = 0;
 	localToRemote.written_bytes = 0;
-	localToRemote.inname = "local";
-	localToRemote.outname = "remote";
+	localToRemote.inname = (char*)"local";
+	localToRemote.outname = (char*)"remote";
 	if (icer->mode == CLIENT) {
 		remoteToLocal.out = g_unix_output_stream_new(fileno(stdout), true);
 		localToRemote.in = g_unix_input_stream_new(fileno(stdin), TRUE);
@@ -447,6 +447,7 @@ void Agent::component_state_changed(NiceAgent *agent, guint stream_id,
 		}
 		g_input_stream_read_async(a->localToRemote.in, a->localToRemote.buffer, buffer_size, 
 				G_PRIORITY_DEFAULT, NULL, &read_func, (gpointer)&(a->localToRemote));
+		//g_timeout_add(5000, (int (*)(void*))&timeoutCheck, (gpointer) a);
 
 		NiceCandidate *local, *remote;
 		// Get current selected candidate pair and print IP address used

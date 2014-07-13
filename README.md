@@ -10,7 +10,7 @@ The idea is to get ssh between two computers behind firewalls. But it could be a
 Unfortunately xicecat requires > libnice-0.1.5 which is not in the ubuntu/debian repos so for now you will have to compile that yourself.
 
 	sudo apt-get install build-essential libgloox-dev libnice-dev
-	g++ -o xicecat xicecat.cpp `pkg-config gloox nice --cflags --libs`
+	g++ -o xicecat xicecat.cpp `pkg-config gloox nice gio-unix-2.0 --cflags --libs`
 
 alternatively if you have a redo program
 
