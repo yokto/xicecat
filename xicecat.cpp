@@ -23,6 +23,10 @@
 #include <sstream>
 #include <string>
 
+#include<sys/socket.h>
+#include<errno.h> //For errno - the error number
+#include<netdb.h> //hostent
+
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -39,6 +43,8 @@ GError * error = NULL;
 class Icer;
 
 const static int buffer_size = 65536;
+
+GMainLoop *gloop = NULL;
 
 struct StreamState {
 	GInputStream * in;
@@ -61,10 +67,6 @@ public:
 	StreamState localToRemote;
 
 	GIOStream * gstream;
-	
-	GMainLoop *gloop = NULL;
-
-	int sock;
 
 	NiceAgent * agent;
 	guint stream_id;
@@ -109,13 +111,14 @@ class Icer : public MessageHandler, public ConnectionListener
 private:
 	JID * otherJid;
 public:
-	Client* c;
+	Client* xmppClient;
 	Mode mode;
 	static const string request;
 	Agent* agent;
 	gchar* stun_addr;
 	guint stun_port;
 	char* localport;
+	bool connected;
 
 	const static int pipe_buffer_size = 65536;
 	unsigned char* pipe_buffer;
@@ -124,13 +127,14 @@ public:
 	bool isChildProcess;
 
 	Icer(Client *c, JID * otherJid, Mode mode, gchar* stun_addr, guint stun_port, char * localport)
-		: c(c), otherJid(otherJid), mode(mode), stun_addr(stun_addr), stun_port(stun_port), localport(localport)
+		: xmppClient(c), otherJid(otherJid), mode(mode), stun_addr(stun_addr), stun_port(stun_port), localport(localport)
 	{
-		c->registerConnectionListener(this);
-		c->registerMessageHandler(this);
+		xmppClient->registerConnectionListener(this);
+		xmppClient->registerMessageHandler(this);
 		
 		pendingAnswer = false;
 		isChildProcess = false;
+		connected = false;
 		
 		if(pipe(pipefd) != 0) { g_error("no pipe"); }
 		pipe_buffer = (unsigned char*) malloc(pipe_buffer_size);
@@ -141,24 +145,24 @@ public:
 // 		}
 	}
 	void onConnect() {
-		g_debug("connected yes with jid: %s", c->jid().full().c_str());
+		connected=true;
+		g_debug("connected yes with jid: %s", xmppClient->jid().full().c_str());
 		if (mode == CLIENT) {
-			c->send(Message(Message::Normal, *otherJid, "hi"));
+			xmppClient->send(Message(Message::Normal, *otherJid, "hi"));
 			agent = new Agent(this, *otherJid);
 		}
 		if (mode == SERVER && pendingAnswer == true) {
 			requestICE(*otherJid,string((char*)pipe_buffer));
 			pendingAnswer = false;
 		}
-		g_debug("connected finish");
 	}
 	bool onTLSConnect(const CertInfo& cert) {
 		g_debug("ignoring tls certificate (we don't care)");
 		return true;
 	}
 	void onDisconnect(ConnectionError e) {
-		g_warning("stream error: %d", c->streamError());
-		g_warning("stream error text: %s", c->streamErrorText().c_str());
+		g_warning("stream error: %d", xmppClient->streamError());
+		g_warning("stream error text: %s", xmppClient->streamErrorText().c_str());
 	}
 	void handleMessage (const Message &msg, MessageSession *session=0) {
 		g_debug("XMPP Message: %s\n\t%s", msg.subject().c_str(), msg.body().c_str());
@@ -168,7 +172,7 @@ public:
 			//g_debug("sent ack");
 			if (mode==SERVER) {
 				fflush(stdout);
-				c->disconnect();
+				xmppClient->disconnect();
 				pid_t pid = fork();
 				if (pid < 0) { g_error("Failed to fork."); }
 				if (pid > 0) { 
@@ -188,19 +192,18 @@ public:
 					if (pid < 0) { g_error("Failed to fork 2."); }
 					if (pid > 0) { exit(0); } // orphan child process by exiting
 					if (pid == 0) {
+						gloop = g_main_loop_new(NULL, false);	
 						agent = new Agent(this, msg.from());
 						agent->parse_remote_data(1, msg.body());
 						g_debug("starting gloop server");
 						g_unix_signal_add (15, &slp, NULL);
-						//g_timeout_add(5000, &Agent::closeTimeout, (void*) agent->gstream);
-						g_main_loop_run(agent->gloop);
+						g_main_loop_run(gloop);
 						g_error("how can this end");
 					}
 				}
 			} else {
+				pendingAnswer=false;
 				agent->parse_remote_data(1, msg.body());
-				g_debug("starting gloop client");
-				g_main_loop_run(agent->gloop);
 			}
 		}
 	}
@@ -211,12 +214,39 @@ public:
 };
 const string Icer::request = "REQUEST ICE";
 
+int hostname_to_ip(char * hostname , char* ip)
+{
+    struct hostent *he;
+    struct in_addr **addr_list;
+    int i;
+         
+    if ( (he = gethostbyname( hostname ) ) == NULL)
+    {
+        // get the host info
+        g_error("gethostbyname");
+    }
+ 
+    addr_list = (struct in_addr **) he->h_addr_list;
+     
+    for(i = 0; addr_list[i] != NULL; i++)
+    {
+        //Return the first one;
+        strcpy(ip , inet_ntoa(*addr_list[i]) );
+        return 0;
+    }
+          
+    g_error("gethostbyname");
+    return 1;
+}
+
 void argFail(char * prog) {
 	g_error("\nUsage: %s server <jid@example.com/resource> <password> <stun.example.com> <stun_port> <localport>\n"
 				"       %s client <jid@example.com> <password> <stun.example.com> <stun_port> <server_jid@example.com/resource\n",
 				prog, prog);
 	exit(EXIT_FAILURE);
 }
+
+static char stun_host[100];
 
 int main(int argc, char* argv[]) {
 	g_debug("debuging");
@@ -256,23 +286,41 @@ int main(int argc, char* argv[]) {
 		}
 	}
 	
-	
-	stun_addr = argv[4];
+	hostname_to_ip(argv[4],stun_host);
+	stun_addr = stun_host;
 	stun_port = atoi(argv[5]);
 
 	Client* client = new Client(myJid, password);
 	Icer * icer = new Icer(client, otherJid,mode,stun_addr,stun_port, localport);
-	while (true) {
-		client->connect(true);
+
+	
+	if(mode == SERVER) {
+		while (true) {
+			client->connect(true);
+		}
+	}
+	else {
+		gloop = g_main_loop_new(NULL, false);
+		client->connect(false);
+		while(icer->connected == false) {
+			client->recv(100000);
+		}
+		g_debug("starting gloop");
+		g_main_loop_run(gloop);
 	}
 
+	g_main_loop_unref(gloop);
 	return 0;
 }
 
 void Icer::requestICE(const JID & jid, const string & cands) {
 	g_debug("requesting ice");
 	Message m(Message::Normal, jid, cands, Icer::request);
-	c->send(m);
+	xmppClient->send(m);
+	pendingAnswer=true;
+	while(pendingAnswer && mode==CLIENT) {
+		xmppClient->recv();
+	}
 }
 
 static void read_func(GObject *obj, GAsyncResult *res, gpointer sstate_);
@@ -310,17 +358,13 @@ static void written_func(GObject *obj, GAsyncResult *res, gpointer sstate_) {
 Agent::~Agent() {	
 	delete otherJid;
 
-	if (parent->mode=SERVER) { close(sock); }
-	
 	g_object_unref(agent);
-	g_main_loop_unref(gloop);
 }
 
 Agent::Agent(Icer * icer, const JID & otherJid) : parent(icer) {
 	connCheckNum=0;
 	negotiationComplete[NICE_COMPONENT_TYPE_RTP]=false;
 	negotiationComplete[NICE_COMPONENT_TYPE_RTCP]=false;
-	gloop = g_main_loop_new(NULL, false);	
 	this->otherJid = new JID(otherJid.full());
 	gboolean controlling = icer->mode == CLIENT ? true : false;
 	g_debug("creating nice agent");
@@ -329,6 +373,7 @@ Agent::Agent(Icer * icer, const JID & otherJid) : parent(icer) {
 	if (agent == NULL)
 		g_error("Failed to create agent");
 
+	g_debug("setting stun server %s:%d", icer->stun_addr, icer->stun_port);
 	g_object_set(G_OBJECT(agent), "stun-server", icer->stun_addr, NULL);
 	g_object_set(G_OBJECT(agent), "stun-server-port", icer->stun_port, NULL);
 	g_object_set(G_OBJECT(agent), "controlling-mode", controlling, NULL);
@@ -456,20 +501,15 @@ void Agent::gathering_done(NiceAgent *agent1, guint stream_id, gpointer data)
 	string candidates = string();
 	g_debug("SIGNAL candidate gathering done");
 
-// 	// Candidate gathering is done. Send our local candidates on stdout
-// 	agent->print_local_data(stream_id, 1, candidates);
-// 	g_debug("Candidates are:\n\t%s", candidates.c_str());
-// 
-
-
 	gchar* sdp = nice_agent_generate_local_sdp (agent->agent);
 	g_debug("cands:\n%scands_done",sdp);
-	//agent->parent->requestICE(*(agent->otherJid), candidates);
 	
 	if(strlen(sdp)+1 > Icer::pipe_buffer_size) { g_error("too many candidates"); }
 	write(agent->parent->pipefd[1], sdp, strlen(sdp)+1);
 	
-	agent->parent->requestICE(*(agent->otherJid), string(sdp));
+	if(agent->parent->mode == CLIENT) {
+		agent->parent->requestICE(*(agent->otherJid), string(sdp));
+	}
 	g_free(sdp);
 }
 
