@@ -167,43 +167,45 @@ public:
 	void handleMessage (const Message &msg, MessageSession *session=0) {
 		g_debug("XMPP Message: %s\n\t%s", msg.subject().c_str(), msg.body().c_str());
 
-		if (msg.subject()==request) {
-			//c->send(Message(Message::Normal, , "ack"));
-			//g_debug("sent ack");
-			if (mode==SERVER) {
-				fflush(stdout);
-				xmppClient->disconnect();
-				pid_t pid = fork();
-				if (pid < 0) { g_error("Failed to fork."); }
-				if (pid > 0) { 
-					/* parent */
-					g_debug("waiting for first fork");
-					waitpid(pid, NULL, 0);
-					
-					int readed = read(pipefd[0], pipe_buffer, pipe_buffer_size);
-					if (readed < 1 || pipe_buffer[readed] != 0) { g_error("something is wrong with candidates"); }
-					g_debug("going to send candidates");
-					otherJid = new JID(msg.from().full());
-					pendingAnswer = true;
-				}
-				if (pid == 0) { // child
-					isChildProcess = true;
-					pid = fork(); // double fork to make orphan process
-					if (pid < 0) { g_error("Failed to fork 2."); }
-					if (pid > 0) { exit(0); } // orphan child process by exiting
-					if (pid == 0) {
-						gloop = g_main_loop_new(NULL, false);	
-						agent = new Agent(this, msg.from());
-						agent->parse_remote_data(1, msg.body());
-						g_debug("starting gloop server");
-						g_unix_signal_add (15, &slp, NULL);
-						g_main_loop_run(gloop);
-						g_error("how can this end");
-					}
-				}
-			} else {
-				pendingAnswer=false;
+		if (msg.subject()!=request) { return; }
+		
+		//c->send(Message(Message::Normal, , "ack"));
+		//g_debug("sent ack");
+		if (mode==CLIENT) {
+			pendingAnswer=false;
+			agent->parse_remote_data(1, msg.body());
+			return;
+		}
+		
+		// mode==SERVER 
+		fflush(stdout);
+		xmppClient->disconnect();
+		pid_t pid = fork();
+		if (pid < 0) { g_error("Failed to fork."); }
+		if (pid > 0) { 
+			/* parent */
+			g_debug("waiting for first fork");
+			waitpid(pid, NULL, 0);
+			
+			int readed = read(pipefd[0], pipe_buffer, pipe_buffer_size);
+			if (readed < 1 || pipe_buffer[readed] != 0) { g_error("something is wrong with candidates"); }
+			g_debug("going to send candidates");
+			otherJid = new JID(msg.from().full());
+			pendingAnswer = true;
+		}
+		if (pid == 0) { // child
+			isChildProcess = true;
+			pid = fork(); // double fork to make orphan process
+			if (pid < 0) { g_error("Failed to fork 2."); }
+			if (pid > 0) { exit(0); } // orphan child process by exiting
+			if (pid == 0) {
+				gloop = g_main_loop_new(NULL, false);	
+				agent = new Agent(this, msg.from());
 				agent->parse_remote_data(1, msg.body());
+				g_debug("starting gloop server");
+				g_unix_signal_add (15, &slp, NULL);
+				g_main_loop_run(gloop);
+				g_error("how can this end");
 			}
 		}
 	}
@@ -249,7 +251,7 @@ void argFail(char * prog) {
 static char stun_host[100];
 
 int main(int argc, char* argv[]) {
-	g_debug("debuging");
+	g_debug("debugging");
 	//nice_debug_enable (true);
 	Mode mode;
 	string password;
@@ -521,40 +523,42 @@ void Agent::component_state_changed(NiceAgent *agent, guint stream_id,
 	g_debug("SIGNAL: state changed stream=%d component=%d %s[%d]",
 		stream_id, component_id, nice_component_state_to_string((NiceComponentState)state), state);
 
-	if (state == NICE_COMPONENT_STATE_READY) {
-		if(a->negotiationComplete[component_id] == true) {
-			g_warning("two times complete");
-			return;
-		} else {
-			a->negotiationComplete[component_id] = true;
-		}
-		if(component_id == NICE_COMPONENT_TYPE_RTP) {
-			g_input_stream_read_async(a->localToRemote.in, a->localToRemote.buffer, buffer_size, 
-				G_PRIORITY_DEFAULT, NULL, &read_func, (gpointer)&(a->localToRemote));
-		} else if (component_id == NICE_COMPONENT_TYPE_RTCP) {
-			a->sendConnCheck();
-		}
-
-		NiceCandidate *local, *remote;
-		// Get current selected candidate pair and print IP address used
-		if (nice_agent_get_selected_pair (agent, stream_id, component_id,
-				&local, &remote)) {
-			gchar ipaddr_local[INET6_ADDRSTRLEN];
-			gchar ipaddr_remote[INET6_ADDRSTRLEN];
-
-			nice_address_to_string(&local->addr, ipaddr_local);
-			nice_address_to_string(&remote->addr, ipaddr_remote);
-			g_debug("Negotiation complete: (%s://s[%s]:%d, %s://[%s]:%d)",
-				candidate_transport_name[local->transport],
-					ipaddr_local, nice_address_get_port(&local->addr),
-				candidate_transport_name[remote->transport],
-					ipaddr_remote, nice_address_get_port(&remote->addr));
-		}
-
-	} else if (state == NICE_COMPONENT_STATE_FAILED || state == NICE_COMPONENT_STATE_DISCONNECTED) {
+	if (state == NICE_COMPONENT_STATE_FAILED || state == NICE_COMPONENT_STATE_DISCONNECTED) {
 		g_error("component failed. This could be a normal eof.");
 		exit(0);
 	}
+	
+	if (state != NICE_COMPONENT_STATE_READY) { return; }
+	
+	// state == NICE_COMPONENT_STATE_READY
+	if(a->negotiationComplete[component_id] == true) {
+		g_warning("two times complete");
+		return;
+	} else {
+		a->negotiationComplete[component_id] = true;
+	}
+	if(component_id == NICE_COMPONENT_TYPE_RTP) {
+		g_input_stream_read_async(a->localToRemote.in, a->localToRemote.buffer, buffer_size, 
+			G_PRIORITY_DEFAULT, NULL, &read_func, (gpointer)&(a->localToRemote));
+	} else if (component_id == NICE_COMPONENT_TYPE_RTCP) {
+		a->sendConnCheck();
+	}
+
+	NiceCandidate *local, *remote;
+	// Get current selected candidate pair and print IP address used
+	if (!nice_agent_get_selected_pair (agent, stream_id, component_id, &local, &remote)) {
+		g_error("can't get selected pair");
+	}
+	
+	gchar ipaddr_local[INET6_ADDRSTRLEN];
+	gchar ipaddr_remote[INET6_ADDRSTRLEN];
+	nice_address_to_string(&local->addr, ipaddr_local);
+	nice_address_to_string(&remote->addr, ipaddr_remote);
+	g_debug("Negotiation complete: (%s://s[%s]:%d, %s://[%s]:%d)",
+			candidate_transport_name[local->transport],
+			ipaddr_local, nice_address_get_port(&local->addr),
+			candidate_transport_name[remote->transport],
+			ipaddr_remote, nice_address_get_port(&remote->addr));
 }
 
 void Agent::new_selected_pair(NiceAgent *agent, guint stream_id,
